@@ -1,0 +1,22 @@
+# Core ML / embeddings
+sentence-transformers==2.7.0
+scikit-learn==1.4.2
+scikit-fuzzy==0.4.2
+numpy==1.26.4
+scipy==1.13.0
+
+# Vector store
+chromadb==0.5.0
+
+# API
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+pydantic==2.7.1
+
+# Data handling
+pandas==2.2.2
+
+# Utilities
+python-dotenv==1.0.1
+tqdm==4.66.4
+networkx==3.3  # required by scikit-fuzzy
