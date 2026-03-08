@@ -1,16 +1,9 @@
 """
-search.py
----------
-Orchestrates the full query pipeline with explicit PCA projection.
-
-The projection happens HERE, not inside the cache, so the cache always
-receives clean, normalised, same-dimensional vectors. This avoids the
-inheritance / dimension-mismatch bugs that caused silent failures.
+search.py — orchestrates embed → cache lookup → vector search → cache store.
+UMAP projection happens here explicitly before any cache operation.
 """
 
 import logging
-import os
-import pickle
 from dataclasses import dataclass
 from typing import Optional
 
@@ -38,68 +31,60 @@ def _format_result(vector_results: list[dict], query: str) -> str:
         return "No relevant documents found."
     top = vector_results[0]
     category = top["metadata"].get("category", "unknown")
-    cluster = top["metadata"].get("dominant_cluster", -1)
-    text_snippet = top["text"][:500].replace("\n", " ").strip()
+    cluster  = top["metadata"].get("dominant_cluster", -1)
+    snippet  = top["text"][:500].replace("\n", " ").strip()
     lines = [
         f"Top match (similarity: {top['similarity']:.3f})",
         f"Category: {category} | Cluster: {cluster}",
-        f"Excerpt: {text_snippet}",
+        f"Excerpt: {snippet}",
         "",
         f"Found {len(vector_results)} relevant documents.",
     ]
     if len(vector_results) > 1:
-        other_cats = set(r["metadata"].get("category", "?") for r in vector_results[1:])
-        lines.append("Other relevant categories: " + ", ".join(other_cats))
+        other = set(r["metadata"].get("category", "?") for r in vector_results[1:])
+        lines.append("Other relevant categories: " + ", ".join(other))
     return "\n".join(lines)
 
 
-def _project_and_normalize(embedding: np.ndarray, pca) -> np.ndarray:
+def _project_and_normalize(embedding: np.ndarray, reducer) -> np.ndarray:
     """
-    Project a 384-dim embedding to PCA space and L2-normalise.
-    Returns a unit vector in the reduced space.
-    Both lookup and store use this — guarantees dot product == cosine similarity.
+    Project a raw embedding through UMAP (or PCA) and L2-normalise.
+    Both lookup and store pass through this — guarantees dot product
+    equals cosine similarity inside cache bucket comparisons.
     """
-    reduced = pca.transform(embedding.reshape(1, -1))[0].astype(np.float32)
+    reduced = reducer.transform(embedding.reshape(1, -1))[0].astype(np.float32)
     norm = np.linalg.norm(reduced)
     return reduced / norm if norm > 0 else reduced
 
 
 class SearchService:
-    """
-    Stateful search service. Instantiated once at FastAPI startup.
-    Holds the PCA model explicitly so projection is transparent and debuggable.
-    """
-
     def __init__(
         self,
         vector_store: VectorStore,
         cache: SemanticCache,
-        pca,                    # sklearn PCA fitted on corpus embeddings
+        reducer,           # fitted UMAP (or PCA) model
         n_results: int = 10,
     ):
         self.vector_store = vector_store
         self.cache = cache
-        self.pca = pca
+        self.reducer = reducer
         self.n_results = n_results
 
     def query(self, query_text: str) -> SearchResponse:
         logger.info(f"Query: '{query_text[:80]}'")
 
-        # 1. Embed in full 384-dim space (used for vector DB search)
+        # 1. Embed in full 384-dim space (for vector DB search)
         raw_embedding = self.vector_store.embed_query(query_text)
 
-        # 2. Project + normalise to 50-dim for cache operations
-        cache_embedding = _project_and_normalize(raw_embedding, self.pca)
+        # 2. Project to reduced space + normalise (for cache operations)
+        cache_embedding = _project_and_normalize(raw_embedding, self.reducer)
 
-        logger.debug(f"raw_embedding norm: {np.linalg.norm(raw_embedding):.4f}, "
-                     f"cache_embedding norm: {np.linalg.norm(cache_embedding):.4f}")
-
-        # 3. Cache lookup (uses 50-dim normalised vector)
+        # 3. Cache lookup
         cache_result: CacheLookupResult = self.cache.lookup(query_text, cache_embedding)
 
         if cache_result.hit:
             logger.info(
-                f"Cache HIT — matched: '{cache_result.matched_query[:60]}' "
+                f"Cache HIT — '{cache_result.matched_query[:60]}' "
                 f"(sim={cache_result.similarity_score:.4f})"
             )
             return SearchResponse(
@@ -112,30 +97,21 @@ class SearchService:
                 top_documents=[],
             )
 
-        # 4. Vector search with full 384-dim embedding
+        # 4. Vector search (miss)
         logger.info("Cache MISS — running vector search")
         vector_results = self.vector_store.query(
             query_embedding=raw_embedding,
             n_results=self.n_results,
         )
-
         result_text = _format_result(vector_results, query_text)
 
         dominant_cluster = -1
         if vector_results:
             dominant_cluster = vector_results[0]["metadata"].get("dominant_cluster", -1)
 
-        # 5. Store in cache using 50-dim normalised vector
-        self.cache.store(
-            query=query_text,
-            query_embedding=cache_embedding,
-            result=result_text,
-        )
-
-        logger.info(
-            f"Stored in cache. Stats: {self.cache.stats['total_entries']} entries, "
-            f"{self.cache.stats['miss_count']} misses"
-        )
+        # 5. Store in cache
+        self.cache.store(query=query_text, query_embedding=cache_embedding, result=result_text)
+        logger.info(f"Cached. Stats: {self.cache.stats['total_entries']} entries")
 
         return SearchResponse(
             query=query_text,

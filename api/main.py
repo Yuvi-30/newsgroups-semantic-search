@@ -1,7 +1,8 @@
 """
 api/main.py — FastAPI service.
-PCA projection is handled in SearchService, not the cache.
-Cache always receives clean, normalised, 50-dim vectors.
+Loads UMAP model for dimensionality reduction before cache operations.
+Falls back to PCA (./models/pca.pkl) if UMAP model not found,
+so existing setups don't break.
 """
 
 import logging
@@ -68,32 +69,44 @@ async def lifespan(app: FastAPI):
     collection   = os.getenv("CHROMA_COLLECTION", "newsgroups")
     model_name   = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
     cluster_path = os.getenv("CLUSTER_MODEL_PATH", "./models/fuzzy_clusters.pkl")
+    umap_path    = "./models/umap.pkl"
     pca_path     = "./models/pca.pkl"
     threshold    = float(os.getenv("CACHE_SIMILARITY_THRESHOLD", "0.85"))
     fuzzifier    = float(os.getenv("FUZZY_M", "2.0"))
 
-    for path, label in [
-        (db_path,      "ChromaDB"),
-        (cluster_path, "Clustering model"),
-        (pca_path,     "PCA model"),
-    ]:
+    # Validate prerequisites
+    for path, label in [(db_path, "ChromaDB"), (cluster_path, "Clustering model")]:
         if not os.path.exists(path):
             raise RuntimeError(f"{label} not found at '{path}'. Run setup scripts first.")
 
-    # Load all components
+    # Load reducer — prefer UMAP, fall back to PCA
+    if os.path.exists(umap_path):
+        with open(umap_path, "rb") as f:
+            reducer = pickle.load(f)
+        reducer_dims = reducer.n_components
+        logger.info(f"UMAP model loaded: {reducer_dims} components")
+    elif os.path.exists(pca_path):
+        with open(pca_path, "rb") as f:
+            reducer = pickle.load(f)
+        reducer_dims = reducer.n_components_
+        logger.info(f"PCA model loaded: {reducer_dims} components (consider re-running cluster.py with UMAP)")
+    else:
+        raise RuntimeError("No reducer model found. Run scripts/cluster.py first.")
+
+    # Load vector store and clustering
     vector_store = VectorStore(db_path=db_path, collection_name=collection, model_name=model_name)
     logger.info(f"Vector store: {vector_store.count()} documents")
 
     clustering = load_clustering(cluster_path)
-    logger.info(f"Clustering: {clustering.n_clusters} clusters, FPC={clustering.partition_coefficient:.4f}, centroid shape={clustering.centroids.shape}")
+    logger.info(
+        f"Clustering: {clustering.n_clusters} clusters, "
+        f"FPC={clustering.partition_coefficient:.4f}, "
+        f"centroid shape={clustering.centroids.shape}"
+    )
 
-    with open(pca_path, "rb") as f:
-        pca = pickle.load(f)
-    logger.info(f"PCA: {pca.n_components_} components, {pca.explained_variance_ratio_.sum():.1%} variance explained")
-
-    # Sanity check: centroid dims must match PCA output dims
-    assert clustering.centroids.shape[1] == pca.n_components_, (
-        f"Centroid dim {clustering.centroids.shape[1]} != PCA components {pca.n_components_}. "
+    # Sanity check dimensions match
+    assert clustering.centroids.shape[1] == reducer_dims, (
+        f"Centroid dim ({clustering.centroids.shape[1]}) != reducer output dim ({reducer_dims}). "
         "Re-run scripts/cluster.py."
     )
 
@@ -105,11 +118,10 @@ async def lifespan(app: FastAPI):
         top_k_clusters=2,
     )
 
-    # SearchService owns the PCA model and handles projection explicitly
     search_service = SearchService(
         vector_store=vector_store,
         cache=cache,
-        pca=pca,
+        reducer=reducer,
         n_results=10,
     )
 
@@ -150,7 +162,6 @@ async def query_endpoint(request: Request, body: QueryRequest):
     except Exception as e:
         logger.exception("Error processing query")
         raise HTTPException(status_code=500, detail=str(e))
-
     return QueryResponse(
         query=response.query,
         cache_hit=response.cache_hit,

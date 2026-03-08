@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  semantic-search:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./embeddings:/app/embeddings
+      - ./models:/app/models
+    environment:
+      - CHROMA_DB_PATH=/app/embeddings/chroma_db
+      - CLUSTER_MODEL_PATH=/app/models/fuzzy_clusters.pkl
+      - CACHE_SIMILARITY_THRESHOLD=0.85
+      - EMBEDDING_MODEL=all-MiniLM-L6-v2
+    restart: unless-stopped
